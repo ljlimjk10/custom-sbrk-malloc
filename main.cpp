@@ -1,5 +1,8 @@
 #include <iostream>
 #include <unistd.h>
+#include <sys/mman.h>
+
+// todo: use a diff struct for memory allocated via mmap to avoid unncessary fields
 
 class SbrkMemoryAllocator
 {
@@ -8,12 +11,15 @@ private:
     {
         size_t size;
         bool isFree;
+        bool isMmapAllocated;
         MemoryBlock* next; // next blk
         MemoryBlock* nextFree; // next blk in free list
     };
 
     constexpr static size_t MIN_PAYLOAD_SIZE = 8;
     constexpr static size_t MIN_USEABLE_SIZE = sizeof(MemoryBlock)+MIN_PAYLOAD_SIZE;
+
+    constexpr static size_t MMAP_THRESHOLD = 128*1024; // 128KB
 
     MemoryBlock* freeListHead = nullptr; // only free blocks
     MemoryBlock* blockListHead = nullptr; // all blocks
@@ -22,6 +28,15 @@ private:
 public:
     void* malloc(size_t size)
     {
+        if (size >= MMAP_THRESHOLD)
+        {
+            size_t totalSize = size+sizeof(MemoryBlock);
+            void* mem = mmap(nullptr, totalSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            if (mem == MAP_FAILED) return nullptr;
+            MemoryBlock* block = initialiseBlock(mem, size, true);
+            return reinterpret_cast<void*>(block+1);
+        }
+
         MemoryBlock* freeBlock = findFreeBloc(size);
         if (freeBlock)
         {
@@ -35,11 +50,7 @@ public:
         void* mem = sbrk(size+sizeof(MemoryBlock));
         if (mem == reinterpret_cast<void*>(static_cast<std::intptr_t>(-1))) return nullptr;
 
-        MemoryBlock* block = reinterpret_cast<MemoryBlock*>(mem);
-        block->size = size;
-        block->isFree = false;
-        block->next = nullptr;
-        block->nextFree = nullptr;
+        MemoryBlock* block = initialiseBlock(mem, size, false);
         appendToBlockList(block);
 
         return reinterpret_cast<void*>(block+1);
@@ -48,13 +59,29 @@ public:
     void free(void* ptr)
     {
         if (!ptr) return;
-        MemoryBlock* block = reinterpret_cast<MemoryBlock*>(ptr);
+        auto* block = reinterpret_cast<MemoryBlock*>(static_cast<char*>(ptr) - sizeof(MemoryBlock));
+
+        if (block->isMmapAllocated)
+        {
+            munmap(block, block->size + sizeof(MemoryBlock));
+            return;
+        }
         block->isFree = true;
         addToFreeList(block);
         mergeContigousFreeBlocks();
     }
 
 private:
+    MemoryBlock* initialiseBlock(void* mem, size_t size, bool isMmapAllocated)
+    {
+        auto* block = reinterpret_cast<MemoryBlock*>(mem);
+        block->size = size;
+        block->isFree = false;
+        block->isMmapAllocated = isMmapAllocated;
+        block->next = nullptr;
+        block->nextFree = nullptr;
+        return block;
+    }
     void appendToBlockList(MemoryBlock* block)
     {
         if (!blockListHead)
@@ -105,7 +132,7 @@ private:
         while (curr)
         {
             if (curr->isFree && curr->size >= size) return curr;
-            curr = curr->next;
+            curr = curr->nextFree;
         }
         return nullptr;
     }
@@ -117,12 +144,13 @@ private:
 
     void splitBlock(MemoryBlock* block, size_t size)
     {
-        char* payloadStart = reinterpret_cast<char*>(block+1);
-        MemoryBlock* newBlock = reinterpret_cast<MemoryBlock*>(payloadStart+size);
+        auto* payloadStart = reinterpret_cast<char*>(block+1);
+        auto* newBlock = reinterpret_cast<MemoryBlock*>(payloadStart+size);
 
         newBlock->size = block->size - size - sizeof(MemoryBlock);
         newBlock->isFree = true;
         newBlock->next = block->next;
+        addToFreeList(newBlock);
 
         block->size = size;
         block->next = newBlock;
@@ -137,7 +165,7 @@ private:
             if (curr->isFree && next->isFree)
             {
                 // ensure that both blocks are contigous. note: bound is not inclusive
-                char* currBlockBound = reinterpret_cast<char*>(curr+1) + curr->size;
+                auto* currBlockBound = reinterpret_cast<char*>(curr+1) + curr->size;
                 if (currBlockBound == reinterpret_cast<char*>(next))
                 {
                     // just to maintain correctness of block metadata, the memory is already allocated
@@ -145,7 +173,7 @@ private:
                     curr->next = next->next;
                     removeFromFreeList(next);
                     continue;
-                }çç
+                }
             curr = curr->next;
             }
         }
@@ -168,5 +196,16 @@ int main()
 
     // we should still see some of original buffer since we did not overwrite most of it, simply freed
     std::cout << "Buffer: " << buffer+12 << std::endl;
+
+
+    constexpr size_t LARGE_ALLOC = 512 * 1024;  // 512 KB, triggers mmap
+    char* bigBuffer = static_cast<char*>(allocator.malloc(LARGE_ALLOC));
+    if (bigBuffer) {
+        strcpy(bigBuffer, "This is mmap memory!");
+        std::cout << "BigBuffer (mmap): " << bigBuffer << std::endl;
+        allocator.free(bigBuffer);  // should trigger munmap
+    } else {
+        std::cerr << "Failed to allocate large mmap block!" << std::endl;
+    }
     return 0;
 }
